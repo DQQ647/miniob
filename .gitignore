@@ -1,0 +1,20 @@
+# build artifacts
+build/
+build_*/
+cmake-build-*/
+*.o
+*.a
+*.so
+
+# runtime data
+observer.log
+*.log
+miniob/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

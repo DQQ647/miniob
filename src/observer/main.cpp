@@ -1,0 +1,192 @@
+/* Copyright (c) 2021 OceanBase and/or its affiliates. All rights reserved.
+miniob is licensed under Mulan PSL v2.
+You can use this software according to the terms and conditions of the Mulan PSL v2.
+You may obtain a copy of Mulan PSL v2 at:
+         http://license.coscl.org.cn/MulanPSL2
+THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+See the Mulan PSL v2 for more details. */
+
+#include <iostream>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <string.h>
+
+#include "common/ini_setting.h"
+#include "common/init.h"
+#include "common/lang/string.h"
+#include "common/os/process.h"
+#include "common/os/signal.h"
+#include "common/log/log.h"
+#include "net/server.h"
+#include "net/server_param.h"
+
+using namespace std;
+using namespace common;
+
+#define NET "NET"
+
+static Server *g_server = nullptr;
+
+void usage()
+{
+  cout << "Usage " << endl;
+  cout << "-p: server port. if not specified, the item in the config file will be used" << endl;
+  cout << "-f: path of config file." << endl;
+  cout << "-s: use unix socket and the argument is socket address" << endl;
+  cout << "-P: protocol. {plain(default), mysql, cli}." << endl;
+  cout << "-t: transaction model. {vacuous(default), mvcc}." << endl;
+  cout << "-T: thread handling model. {one-thread-per-connection(default),java-thread-pool}." << endl;
+  cout << "-n: buffer pool memory size in byte" << endl;
+  cout << "-d: run as daemon process." << endl;
+}
+
+void parse_parameter(int argc, char **argv)
+{
+  string        process_name   = get_process_name(argv[0]);
+  ProcessParam *process_param  = the_process_param();
+  process_param->init_default(process_name);
+
+  int          opt;
+  extern char *optarg;
+  // 注意：'d' 后面没有冒号，表示它是一个不带参数的 flag（守护进程模式）
+  while ((opt = getopt(argc, argv, "dp:P:s:t:T:f:o:e:hn:")) > 0) {
+    switch (opt) {
+      case 's': process_param->set_unix_socket_path(optarg); break;
+      case 'p': process_param->set_server_port(atoi(optarg)); break;
+      case 'P': process_param->set_protocol(optarg); break;
+      case 'f': process_param->set_conf(optarg); break;
+      case 'o': process_param->set_std_out(optarg); break;
+      case 'e': process_param->set_std_err(optarg); break;
+      case 't': process_param->set_trx_kit_name(optarg); break;
+      case 'T': process_param->set_thread_handling_name(optarg); break;
+      case 'n': process_param->set_buffer_pool_memory_size(atoi(optarg)); break;
+      case 'd': process_param->set_demon(true); break;
+      case 'h':
+        usage();
+        exit(0);
+        return;
+      default: cout << "Unknown option: " << static_cast<char>(opt) << ", ignored" << endl; break;
+    }
+  }
+}
+
+Server *init_server()
+{
+  std::map<std::string, std::string> net_section    = get_properties()->get(NET);
+  ProcessParam                      *process_param  = the_process_param();
+
+  long listen_addr        = INADDR_ANY;
+  long max_connection_num = MAX_CONNECTION_NUM_DEFAULT;
+  int  port               = PORT_DEFAULT;
+
+  auto it = net_section.find(CLIENT_ADDRESS);
+  if (it != net_section.end()) {
+    str_to_val(it->second, listen_addr);
+  }
+
+  it = net_section.find(MAX_CONNECTION_NUM);
+  if (it != net_section.end()) {
+    str_to_val(it->second, max_connection_num);
+  }
+
+  if (process_param->get_server_port() > 0) {
+    port = process_param->get_server_port();
+    LOG_INFO("Use port config in command line: %d", port);
+  } else {
+    it = net_section.find(PORT);
+    if (it != net_section.end()) {
+      str_to_val(it->second, port);
+    }
+  }
+
+  ServerParam server_param;
+  server_param.listen_addr        = listen_addr;
+  server_param.max_connection_num = max_connection_num;
+  server_param.port               = port;
+
+  if (0 == strcasecmp(process_param->get_protocol().c_str(), "mysql")) {
+    server_param.protocol = CommunicateProtocol::MYSQL;
+  } else if (0 == strcasecmp(process_param->get_protocol().c_str(), "cli")) {
+    server_param.use_std_io = true;
+    server_param.protocol   = CommunicateProtocol::CLI;
+  } else {
+    server_param.protocol = CommunicateProtocol::PLAIN;
+  }
+
+  if (process_param->get_unix_socket_path().size() > 0 && !server_param.use_std_io) {
+    server_param.use_unix_socket  = true;
+    server_param.unix_socket_path = process_param->get_unix_socket_path();
+  }
+  server_param.thread_handling = process_param->thread_handling_name();
+
+  if (server_param.use_std_io) {
+    return new CliServer(server_param);
+  } else {
+    return new NetServer(server_param);
+  }
+}
+
+void *quit_thread_func(void *_signum)
+{
+  intptr_t signum = (intptr_t)_signum;
+  LOG_INFO("Receive signal: %ld", signum);
+  if (g_server) {
+    g_server->shutdown();
+  }
+  return nullptr;
+}
+
+void quit_signal_handle(int signum)
+{
+  set_signal_handler(nullptr);
+  pthread_t tid;
+  pthread_create(&tid, nullptr, quit_thread_func, (void *)(intptr_t)signum);
+}
+
+const char *startup_tips = R"(
+Welcome to the OceanBase database implementation course.
+MiniOB is a tiny database for learning.
+
+Following environment variables are useful:
+  MINIOB_LOG_LEVEL : log level, default is info
+  MINIOB_DATA_DIR  : data directory, default is miniob
+
+)";
+
+int main(int argc, char **argv)
+{
+  process_argc = argc;
+  process_argv = argv;
+
+  cout << startup_tips;
+  set_signal_handler(quit_signal_handle);
+
+  // 1. 解析命令行参数
+  parse_parameter(argc, argv);
+
+  // 2. 初始化运行环境（配置、日志、存储引擎等）
+  int rc = init(the_process_param());
+  if (rc != STATUS_SUCCESS) {
+    cerr << "Failed to init miniob" << endl;
+    cleanup();
+    return rc;
+  }
+
+  // 3. 启动 server
+  g_server = init_server();
+  if (g_server == nullptr) {
+    cerr << "Failed to create server instance" << endl;
+    cleanup();
+    return -1;
+  }
+
+  g_server->serve();
+
+  LOG_INFO("Server stopped");
+  cleanup();
+  delete g_server;
+  g_server = nullptr;
+  return 0;
+}
