@@ -18,3 +18,4 @@ miniob/
 
 # OS
 .DS_Store
+.github/workflows/
